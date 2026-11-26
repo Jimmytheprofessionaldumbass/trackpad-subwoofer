@@ -16,6 +16,22 @@ trackpad *talk*; this one makes it *rumble*.
 
 ## Build
 
+### Just download it
+
+Grab the latest release and run it:
+
+```sh
+curl -fsLO https://github.com/Jimmytheprofessionaldumbass/trackpad-subwoofer/releases/latest/download/trackpad-subwoofer.zip
+unzip trackpad-subwoofer.zip
+./trackpad-subwoofer
+```
+
+Universal binary (Apple Silicon + Intel), macOS 14.2 or later. It is ad-hoc signed but **not
+notarized**, so Gatekeeper may stop it the first time — right-click → Open, or build it yourself
+below.
+
+### Build from source
+
 Needs Xcode or the Command Line Tools:
 
 ```sh
@@ -24,8 +40,6 @@ git clone https://github.com/Jimmytheprofessionaldumbass/trackpad-subwoofer
 cd trackpad-subwoofer
 ./build.sh
 ```
-
-One binary, Apple Silicon + Intel, **macOS 14.2 or later**.
 
 ## Run
 
