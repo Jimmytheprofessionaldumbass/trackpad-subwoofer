@@ -34,8 +34,9 @@ struct Options {
     var excludeApp: String? = nil
     var cutoffHz: Double = 120      // low-pass corner: the top of the subwoofer band
     var highpassHz: Double = 20     // DC blocker corner
-    var minDriveHz: Double = 35     // lowest frequency the motor is asked to make
+    var minDriveHz: Double = 60     // lowest frequency the motor is asked to make
     var maxDriveHz: Double = 150    // highest frequency the motor is asked to make
+    var waveform: String = "sine"   // sine | square | sawtooth
     var floorDb: Double = -55       // below this, the bass counts as silence
     var ceilingDb: Double = -12     // at or above this, full drive
     var gamma: Double = 1.5         // >1 makes the response less eager
@@ -59,6 +60,13 @@ struct Options {
 
 var stopRequested = false
 
+/// The range the trackpad's haptic motor can actually produce. Apple's own actuation tables
+/// bottom out at 60 Hz (their lowest FrequencykHz is 0.06), and the encoder quantises the
+/// requested frequency logarithmically onto that table. Asking for less doesn't give you less —
+/// it gives you the lowest tone available, or a mushy one. So the drive is clamped here.
+let hardwareMinHz: Double = 60
+let hardwareMaxHz: Double = 3800
+
 // Where the meter goes, and where errors go once the terminal has been silenced.
 var outFD: Int32 = STDOUT_FILENO
 var savedOut: Int32 = -1, savedErr: Int32 = -1
@@ -74,8 +82,11 @@ trackpad-subwoofer — the Mac's Force Touch trackpad as a subwoofer, driven by 
                     (e.g. --exclude-app Spotify, so the program doesn't hear itself)
   --cutoff HZ       low-pass corner; the top of the sub band            (default 120)
   --highpass HZ     DC blocker corner                                   (default 20)
-  --min-hz HZ       lowest motor frequency                              (default 35)
+  --min-hz HZ       lowest motor frequency                              (default 60)
   --max-hz HZ       highest motor frequency                             (default 150)
+  --waveform WHICH  tone shape: sine, square or sawtooth                (default sine)
+                    square and sawtooth carry harmonics, which is what makes a
+                    low fundamental audible on the trackpad
   --floor-db DB     input level treated as silence                      (default -55)
   --ceiling-db DB   input level that means full drive                   (default -12)
   --gamma G         response curve, >1 is less eager                     (default 1.5)
@@ -156,6 +167,14 @@ func parseOptions() -> Options {
         case "--highpass": o.highpassHz = value(&i, arg)
         case "--min-hz": o.minDriveHz = value(&i, arg)
         case "--max-hz": o.maxDriveHz = value(&i, arg)
+        case "--waveform":
+            i += 1
+            guard i < args.count else { fail("missing a waveform after --waveform") }
+            let w = args[i].lowercased()
+            guard ["sine", "square", "sawtooth"].contains(w) else {
+                fail("--waveform wants sine, square or sawtooth, got \"\(args[i])\"")
+            }
+            o.waveform = w
         case "--floor-db": o.floorDb = value(&i, arg)
         case "--ceiling-db": o.ceilingDb = value(&i, arg)
         case "--gamma": o.gamma = value(&i, arg)
@@ -579,15 +598,30 @@ func openMotor(preferExternal: Bool) -> CFTypeRef {
     fail("found a trackpad, but it has no haptic motor (Force Touch).")
 }
 
+/// The tone-shape names the encoder recognises. It is case-sensitive: "Sine" encodes as type 1,
+/// while "sine" silently falls back to 0 (Gaussian) — no error, just the wrong shape. So the
+/// user's option has to be mapped to the exact dictionary string explicitly.
+func waveformName(_ option: String) -> String {
+    switch option.lowercased() {
+    case "square": return "Square"
+    case "sawtooth": return "Sawtooth"
+    default: return "Sine"
+    }
+}
+
 /// Plays one or more sine tones for `ms` milliseconds at `level` (0...1). The tones' amplitudes are
 /// normalised so they add up to 1: past that the motor is louder, but the driver starts to stall.
-func actuate(tones: [(hz: Double, amp: Double)], ms: Double, level: Float) {
+///
+/// `waveform` is the tone shape: "Sine", "Square" or "Sawtooth". Square and sawtooth carry
+/// harmonics that a pure sine cannot, and those harmonics are what make the glass actually
+/// loud — the fundamental alone is weak at the low end of the trackpad's range.
+func actuate(tones: [(hz: Double, amp: Double)], ms: Double, level: Float, waveform: String = "Sine") {
     guard let motorPointer, !tones.isEmpty else { return }
     let sum = max(tones.reduce(0) { $0 + $1.amp }, 0.0001)
     let shape: [String: Any] = [
         "BaseWaveform": ["Type": "Gaussian", "Amplitude": 0.0, "DurationMS": ms],
         "Tones": tones.map {
-            ["Type": "Sine", "Amplitude": $0.amp / sum, "DurationMS": ms, "DelayMS": 0.0, "FrequencykHz": $0.hz / 1000]
+            ["Type": waveform, "Amplitude": $0.amp / sum, "DurationMS": ms, "DelayMS": 0.0, "FrequencykHz": $0.hz / 1000]
         },
     ]
     guard let act = actuationCreate!(shape as CFDictionary, 0) else { return }
@@ -965,8 +999,48 @@ func selfTest(options: Options) -> Never {
     print("  50 Hz sine      -> \(String(format: "%.1f dB", fifty.db))   f0 \(String(format: "%.1f", fifty.hz)) Hz   level \(String(format: "%.2f", fifty.level))")
     check(abs(fifty.hz - 50) <= 8, "50 Hz is detected as 50 Hz")
 
+    // The tone shape the program sends must survive the encoder as a distinct, supported type.
+    // This builds actuation OBJECTS only — it never actuates, so nothing moves and no sound.
+    // It goes through waveformName(), the same mapping the program uses, so a case bug can't hide.
+    print("\n  tone shape encoding (objects only, never actuated):")
+    var typeCodes: [String: Int] = [:]
+    for shape in ["sine", "square", "sawtooth", "notawaveform"] {
+        let sent = waveformName(shape)
+        if let code = encodedToneType(sent) {
+            typeCodes[shape] = code
+            print("    \"\(shape)\" -> sent as \"\(sent)\" -> type code \(code)")
+        } else {
+            print("    \"\(shape)\" -> sent as \"\(sent)\" -> could not build an actuation")
+        }
+    }
+    check(typeCodes["sine"] == 1, "sine encodes as type code 1")
+    check(typeCodes["square"] == 2, "square encodes as type code 2")
+    check(typeCodes["sawtooth"] == 3, "sawtooth encodes as type code 3")
+    check(typeCodes["notawaveform"] == 1, "an unknown shape falls back to sine, not to a silently wrong one")
+
+    // The encoder's type string is case-sensitive: lowercase silently becomes Gaussian.
+    if let lower = encodedToneType("square") {
+        check(lower == 0, "a lowercase type string is rejected by the encoder (so the mapping matters)")
+    }
+
     print("\n  \(failures == 0 ? "all checks passed" : "\(failures) check(s) FAILED")")
     exit(failures == 0 ? 0 : 1)
+}
+
+/// Builds an actuation with one tone of the given shape and reads back the encoded type code.
+/// Creates the object only — never actuates it, so the trackpad does not move and no sound plays.
+func encodedToneType(_ toneType: String) -> Int? {
+    guard let actuationCreate else { return nil }
+    let shape: [String: Any] = [
+        "BaseWaveform": ["Type": "Gaussian", "Amplitude": 0.0, "DurationMS": 20.0],
+        "Tones": [["Type": toneType, "Amplitude": 1.0, "DurationMS": 20.0,
+                    "DelayMS": 0.0, "FrequencykHz": 0.06]],
+    ]
+    guard let act = actuationCreate(shape as CFDictionary, 0) else { return nil }
+    let raw = UnsafeRawPointer(act)
+    let code = Int(raw.load(fromByteOffset: 64, as: UInt8.self))
+    Unmanaged<AnyObject>.fromOpaque(act).release()
+    return code
 }
 
 func analysisLoop(sampleRate: Double, options: Options) {
@@ -1069,19 +1143,20 @@ func hapticLoop(options: Options) {
 
         if target > 0.015 {
             let hz = min(max(options.fixedHz ?? state.hz, options.minDriveHz), options.maxDriveHz)
-            let cycles = max(1, Int((0.020 * hz).rounded()))
-            let segmentMs = 1000.0 * Double(cycles) / hz
+            let driveHz = min(max(hz, hardwareMinHz), hardwareMaxHz)
+            let cycles = max(1, Int((0.020 * driveHz).rounded()))
+            let segmentMs = 1000.0 * Double(cycles) / driveHz
             // Ramp across the segment: drive at the midpoint between last time and now.
             let drive = Float(min(options.maxLevel, max(0, (currentLevel + target) / 2)))
             currentLevel = target
-            control.updateDrive(hz: hz, level: Double(drive))
+            control.updateDrive(hz: driveHz, level: Double(drive))
 
-            var tones: [(hz: Double, amp: Double)] = [(hz: hz, amp: 1.0)]
+            var tones: [(hz: Double, amp: Double)] = [(hz: driveHz, amp: 1.0)]
             if options.harmonic > 0 {
-                tones.append((hz: hz * Double(options.harmonic), amp: options.harmonicAmp))
+                tones.append((hz: driveHz * Double(options.harmonic), amp: options.harmonicAmp))
             }
             if !options.dryRun {
-                actuate(tones: tones, ms: segmentMs, level: drive)
+                actuate(tones: tones, ms: segmentMs, level: drive, waveform: waveformName(options.waveform))
             }
             usleep(useconds_t(max(1000, segmentMs * 1000 - 1200)))
         } else {

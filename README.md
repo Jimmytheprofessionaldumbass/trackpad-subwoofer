@@ -46,7 +46,7 @@ cd trackpad-subwoofer
 ```sh
 ./trackpad-subwoofer                 # rumble with whatever the Mac is playing
 ./trackpad-subwoofer --dry-run       # same analysis, but the trackpad stays still
-./trackpad-subwoofer --selftest      # verify the filter and pitch tracking (no sound at all)
+./trackpad-subwoofer --selftest      # verify the filter, pitch tracking and tone shapes (no sound)
 ./trackpad-subwoofer --check         # what this Mac can do: haptics + capture path
 ./trackpad-subwoofer --help          # every option
 ```
@@ -81,8 +81,9 @@ raise `--gain` (or `--max-level`, up to 1.0).
 | `--exclude-app NAME` | — | Don't capture audio from apps whose bundle id contains `NAME`. |
 | `--cutoff HZ` | 120 | Low-pass corner — the top of the sub band. Lower = more muffled, deeper. |
 | `--highpass HZ` | 20 | DC blocker corner. Keeps infrasonic rumble out of the envelope. |
-| `--min-hz HZ` | 35 | Lowest frequency the motor is asked to make. |
+| `--min-hz HZ` | 60 | Lowest frequency the motor is asked to make. |
 | `--max-hz HZ` | 150 | Highest frequency the motor is asked to make. |
+| `--waveform WHICH` | `sine` | Tone shape: `sine`, `square` or `sawtooth`. Square and sawtooth carry harmonics, which is what makes a low fundamental audible. |
 | `--floor-db DB` | -55 | Input level treated as silence. |
 | `--ceiling-db DB` | -12 | Input level that means full drive. |
 | `--gamma G` | 1.5 | Response curve. Higher = less eager, more "only the loud bass". |
@@ -93,7 +94,7 @@ raise `--gain` (or `--max-level`, up to 1.0).
 | `--attack S` | 0.010 | Envelope attack time, seconds. |
 | `--release S` | 0.120 | Envelope release time, seconds. |
 | `--dry-run` | — | Capture and analyse, but don't drive the trackpad. |
-| `--selftest` | — | Verify the filter and pitch tracking on synthetic signals. No device, no sound. |
+| `--selftest` | — | Verify the filter, pitch tracking and tone-shape encoding. No device, no sound. |
 | `--check` | — | Report the haptic and capture paths, then exit. Captures nothing. |
 | `--list-devices` | — | List input devices, then exit. |
 | `--device WHICH` | default input | Which device to listen to in `--source input` mode: a device id, or part of its name. |
@@ -114,6 +115,9 @@ raise `--gain` (or `--max-level`, up to 1.0).
 
 # audible as well as felt
 ./trackpad-subwoofer --harmonic 3 --harmonic-amp 0.5
+
+# louder: square wave carries harmonics the trackpad can actually make
+./trackpad-subwoofer --waveform square
 
 # don't wake the whole house
 ./trackpad-subwoofer --floor-db -45 --max-level 0.5
@@ -146,20 +150,28 @@ raise `--gain` (or `--max-level`, up to 1.0).
 5. **Haptic.** `MultitouchSupport` (private framework, resolved with `dlopen`/`dlsym`):
    `MTActuatorCreateFromDeviceID` → `MTActuatorOpen` → `MTActuationCreateFromDictionary` →
    `MTActuationActuate`. Each ~20 ms segment is a whole number of cycles of the current drive
-   frequency, so the sine never starts mid-cycle.
+   frequency, so the sine never starts mid-cycle. The tone shape (`Sine`, `Square`, `Sawtooth`)
+   goes in the same dictionary.
 
 ### Notes on the range
 
 The motor can't reproduce true sub-bass, so the program plays the trackpad's strong, felt range:
-roughly **35–150 Hz**. Below that the Taptic engine just thuds; above it the glass gets buzzy
+roughly **60–150 Hz**. Below that the Taptic engine just thuds; above it the glass gets buzzy
 rather than deep. The default band is chosen so it *feels* like a subwoofer rather than sounding
 like one.
 
-The trackpad has no speaker — it has a motor that taps the glass. Driving it at 35–150 Hz makes
-the glass move in slow thumps you can feel through a desk. `--harmonic 3` adds a quieter tone at
-3× the fundamental if you want to *hear* something too.
+**60 Hz is a hard floor, not a default.** Apple's own actuation tables bottom out at 0.06 kHz —
+nothing in them goes lower — and the encoder quantises the frequency you request logarithmically
+onto that table. Asking for 35 Hz does not give you 35 Hz; it gives you the lowest tone the
+hardware has, or a mushy one. The drive is clamped to the hardware's range (60 Hz – 3.8 kHz) so
+the meter never claims a frequency the trackpad cannot produce.
 
-### Three things that bite when you build this
+The trackpad has no speaker — it has a motor that taps the glass. Driving it at 60–150 Hz makes
+the glass move in slow thumps you can feel through a desk. `--waveform square` adds harmonics that
+land in the trackpad's loudest octave (around 1 kHz), which is what turns a faint thump into
+something you can actually hear.
+
+### Four things that bite when you build this
 
 Worth recording, because each one cost a debugging round:
 
@@ -170,6 +182,9 @@ Worth recording, because each one cost a debugging round:
 - **A tap's UID comes from `kAudioTapPropertyUID` ('tuid'), not `kAudioDevicePropertyDeviceUID`.**
   Asking a tap for a device UID doesn't return an error — it **crashes** CoreAudio (SIGSEGV inside
   the property marshaller).
+- **The tone-type string is case-sensitive.** `"Sine"` encodes as type 1, `"Square"` as 2,
+  `"Sawtooth"` as 3 — but `"sine"` or `"square"` silently become 0 (Gaussian). No error, just the
+  wrong waveform, so the program maps its option to the exact dictionary string.
 - **The feedback guard only matters in microphone mode.** With the system-output tap there is no
   acoustic path from the motor back to the source, so no loop is possible. Switch to
   `--source input` and the built-in mic sits right next to the trackpad: the motor shakes the
