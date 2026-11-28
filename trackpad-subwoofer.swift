@@ -34,7 +34,7 @@ struct Options {
     var excludeApp: String? = nil
     var cutoffHz: Double = 120      // low-pass corner: the top of the subwoofer band
     var highpassHz: Double = 20     // DC blocker corner
-    var minDriveHz: Double = 60     // lowest frequency the motor is asked to make
+    var minDriveHz: Double = 93.75  // lowest frequency the motor is asked to make
     var maxDriveHz: Double = 150    // highest frequency the motor is asked to make
     var waveform: String = "sine"   // sine | square | sawtooth
     var floorDb: Double = -55       // below this, the bass counts as silence
@@ -60,12 +60,24 @@ struct Options {
 
 var stopRequested = false
 
-/// The range the trackpad's haptic motor can actually produce. Apple's own actuation tables
-/// bottom out at 60 Hz (their lowest FrequencykHz is 0.06), and the encoder quantises the
-/// requested frequency logarithmically onto that table. Asking for less doesn't give you less —
-/// it gives you the lowest tone available, or a mushy one. So the drive is clamped here.
-let hardwareMinHz: Double = 60
-let hardwareMaxHz: Double = 3800
+/// The range the trackpad's haptic motor can actually produce, measured against the encoder
+/// (not guessed from Apple's tables): the frequency field is an 8-bit *period count at 24 kHz*,
+/// so byte = round(24000 / f_Hz) - 1, clamped to 0..255.
+///   - byte 255 -> 24000/256 = 93.75 Hz  -> the HARD FLOOR. Asking for less gives you 93.75 Hz.
+///     (Apple's own 0.06 kHz and 0.09 kHz entries both encode to byte 255, i.e. they are
+///     indistinguishable after encoding and both render at 93.75 Hz.)
+///   - byte 5   -> 24000/6    = 4000 Hz   -> the top of the range worth using.
+/// The grid is linear in period, so it is fine at the bottom and coarse at the top: below ~600 Hz
+/// the steps are small, above it they are large (3.4/3.6/3.8 kHz all collapse to byte 5).
+/// So the drive is clamped to the hardware's real range and the meter never claims a frequency
+/// the trackpad cannot produce.
+let hardwareMinHz: Double = 93.75
+let hardwareMaxHz: Double = 4000
+
+/// Durations and delays are 8-bit counts of 24 kHz samples, so the longest the encoder will carry
+/// is 255 samples = 10.625 ms. Anything longer is silently clipped, which would leave gaps
+/// between tones. Segments are sized to fit.
+let hardwareMaxSegmentMs: Double = 255.0 / 24.0
 
 // Where the meter goes, and where errors go once the terminal has been silenced.
 var outFD: Int32 = STDOUT_FILENO
@@ -82,7 +94,7 @@ trackpad-subwoofer — the Mac's Force Touch trackpad as a subwoofer, driven by 
                     (e.g. --exclude-app Spotify, so the program doesn't hear itself)
   --cutoff HZ       low-pass corner; the top of the sub band            (default 120)
   --highpass HZ     DC blocker corner                                   (default 20)
-  --min-hz HZ       lowest motor frequency                              (default 60)
+  --min-hz HZ       lowest motor frequency                              (default 93.75)
   --max-hz HZ       highest motor frequency                             (default 150)
   --waveform WHICH  tone shape: sine, square or sawtooth                (default sine)
                     square and sawtooth carry harmonics, which is what makes a
@@ -459,7 +471,11 @@ final class RingBuffer {
 
 /// Everything the audio thread does: mix to mono, strip DC, low-pass, and hand the result over.
 final class InputProcessor {
+    /// The bass band: DC-blocked and low-passed. Used for the level and the pitch.
     let ring = RingBuffer(capacity: 32768)
+    /// The same signal with only the DC blocker applied -- everything above the bass band is still
+    /// there. Used to tell a kick drum (nearly all bass) from a UI click (mostly above the band).
+    let rawRing = RingBuffer(capacity: 32768)
     let dc = DCBlocker()
     // Four cascaded biquads = an 8th-order Butterworth low-pass: 48 dB per octave. Four sections
     // rather than two, because a 4th-order filter leaves a 440 Hz tone only ~22 dB down, and the
@@ -470,6 +486,7 @@ final class InputProcessor {
     let lp4 = Biquad()
     private var channels = 1
     private var scratch = [Float](repeating: 0, count: 8192)
+    private var rawScratch = [Float](repeating: 0, count: 8192)
 
     func configure(sampleRate: Double, channels: Int, cutoff: Double, highpass: Double) {
         self.channels = max(1, channels)
@@ -494,10 +511,13 @@ final class InputProcessor {
                 let base = (offset + f) * ch
                 for c in 0..<ch { sum += Double(data[base + c]) }
                 let mono = sum / Double(ch)
-                let filtered = lp4.process(lp3.process(lp2.process(lp1.process(dc.process(mono)))))
+                let blocked = dc.process(mono)
+                rawScratch[f] = Float(blocked)
+                let filtered = lp4.process(lp3.process(lp2.process(lp1.process(blocked))))
                 scratch[f] = Float(filtered)
             }
             ring.write(scratch, count: chunk)
+            rawRing.write(rawScratch, count: chunk)
             offset += chunk
         }
     }
@@ -508,15 +528,16 @@ final class InputProcessor {
 final class ControlState {
     private let lock = NSLock()
     private var _level = 0.0
-    private var _hz = 60.0
+    private var _hz = 93.75
     private var _db = -120.0
     private var _confidence = 0.0
+    private var _peakRatioDb = 0.0
     private var _driveHz = 0.0
     private var _driveLevel = 0.0
 
-    func update(level: Double, hz: Double, db: Double, confidence: Double) {
+    func update(level: Double, hz: Double, db: Double, confidence: Double, peakRatioDb: Double) {
         lock.lock()
-        _level = level; _hz = hz; _db = db; _confidence = confidence
+        _level = level; _hz = hz; _db = db; _confidence = confidence; _peakRatioDb = peakRatioDb
         lock.unlock()
     }
 
@@ -527,9 +548,9 @@ final class ControlState {
         lock.unlock()
     }
 
-    func read() -> (level: Double, hz: Double, db: Double, confidence: Double) {
+    func read() -> (level: Double, hz: Double, db: Double, confidence: Double, peakRatioDb: Double) {
         lock.lock(); defer { lock.unlock() }
-        return (_level, _hz, _db, _confidence)
+        return (_level, _hz, _db, _confidence, _peakRatioDb)
     }
 
     func readDrive() -> (hz: Double, level: Double) {
@@ -863,6 +884,17 @@ func stopCapture() {
 
 let analysisDecimation = 8
 
+/// Copies every `analysisDecimation`-th sample into `scratch`, with the mean removed.
+func decimateMeanRemoved(_ samples: [Float], count: Int, into scratch: inout [Float]) -> Int {
+    let m = count / analysisDecimation
+    guard m > 0, scratch.count >= m else { return 0 }
+    var mean = 0.0
+    for i in 0..<m { mean += Double(samples[i * analysisDecimation]) }
+    mean /= Double(m)
+    for i in 0..<m { scratch[i] = Float(Double(samples[i * analysisDecimation]) - mean) }
+    return m
+}
+
 /// Normalised autocorrelation of `x` at one lag: how well the signal repeats after `lag` samples.
 func autocorrelationAt(_ x: [Float], _ m: Int, _ lag: Int) -> Double {
     var corr = 0.0, ea = 0.0, eb = 0.0
@@ -878,19 +910,11 @@ func autocorrelationAt(_ x: [Float], _ m: Int, _ lag: Int) -> Double {
 func estimateFundamental(_ samples: [Float], count: Int, sampleRate: Double,
                          minHz: Double, maxHz: Double, scratch: inout [Float]) -> (hz: Double, confidence: Double) {
     let dsr = sampleRate / Double(analysisDecimation)
-    let m = count / analysisDecimation
-    guard m > 64, scratch.count >= m else { return (0, 0) }
-
-    var mean = 0.0
-    for i in 0..<m { mean += Double(samples[i * analysisDecimation]) }
-    mean /= Double(m)
+    let m = decimateMeanRemoved(samples, count: count, into: &scratch)
+    guard m > 64 else { return (0, 0) }
 
     var energy = 0.0
-    for i in 0..<m {
-        let v = Double(samples[i * analysisDecimation]) - mean
-        scratch[i] = Float(v)
-        energy += v * v
-    }
+    for i in 0..<m { let v = Double(scratch[i]); energy += v * v }
     guard energy > 1e-12 else { return (0, 0) }
 
     let minLag = max(2, Int((dsr / maxHz).rounded()))
@@ -917,6 +941,75 @@ func estimateFundamental(_ samples: [Float], count: Int, sampleRate: Double,
     }
     let hz = dsr / max(refined, 1.0)
     return (hz, bestR)
+}
+
+/// The gate's two limits, calibrated against synthetic clicks and real bass (the self test
+/// prints both sides, so the margins are visible rather than asserted).
+///
+///   peakRatio -- how far the loudest sample of the ORIGINAL signal sticks out above the bass
+///                band. A click is broadband: its peak is far above the band while the filtered
+///                peak is tiny, so the ratio runs 27-32 dB. Real bass sits at 0 dB, because the
+///                bass IS the peak. The limit sits in the empty middle: 8.6 dB above the worst
+///                click, 14.7 dB below the worst bass.
+///   crest     -- how transient the bass-band energy is. A click leaves a short ringing tail
+///                whose peak is far above its RMS; a sustained note is flat. Real bass measures
+///                4-5.5 dB, a click 9.7-12.9 dB.
+let peakRatioLimitDb = 18.0
+let crestLimitDb = 9.0
+
+/// What one window of audio turned out to be.
+struct BassWindow {
+    var db = 0.0            // level of the bass band (dBFS)
+    var rawDb = 0.0         // level of the unfiltered signal (dBFS)
+    var peakRatioDb = 0.0   // how far the original signal's peak sticks out above the bass band
+    var crestDb = 0.0       // how transient the bass-band energy is
+    var hz = 0.0            // the detected fundamental
+    var confidence = 0.0    // how periodic the filtered signal is
+    var isBass = false      // true only when this window is real bass, not a click or a knock
+}
+
+/// Measures one window: the level, the fundamental, and whether this is real bass at all.
+///
+/// The level on its own is not enough to drive the motor. A click or a knock is loud enough to
+/// cross the level floor, and the low-pass turns its broadband energy into a convincing-looking
+/// fundamental -- so without this gate, hitting the desk made the trackpad buzz at whatever
+/// frequency was last tracked, and the harder the hit, the harder it buzzed.
+func analyseBassWindow(filtered: [Float], raw: [Float], count: Int, sampleRate: Double,
+                        options: Options, scratch: inout [Float]) -> BassWindow {
+    var out = BassWindow()
+
+    var sumSq = 0.0
+    var peak = 0.0
+    for i in 0..<count {
+        let v = Double(filtered[i]); sumSq += v * v
+        peak = max(peak, abs(v))
+    }
+    let rms = sqrt(sumSq / Double(count))
+    out.db = 20 * log10(max(rms, 1e-9))
+    out.crestDb = 20 * log10(max(peak, 1e-9) / max(rms, 1e-9))
+
+    var rawSumSq = 0.0
+    var rawPeak = 0.0
+    for i in 0..<count {
+        let v = Double(raw[i]); rawSumSq += v * v
+        rawPeak = max(rawPeak, abs(v))
+    }
+    let rawRms = sqrt(rawSumSq / Double(count))
+    out.rawDb = 20 * log10(max(rawRms, 1e-9))
+    out.peakRatioDb = 20 * log10(max(rawPeak, 1e-9) / max(peak, 1e-9))
+
+    // The search stops at twice the low-pass corner: above that the filter has already gutted the
+    // signal, and looking for a peak there only finds leakage and aliases.
+    let searchMaxHz = min(400, max(80, options.cutoffHz * 2))
+    let (hz, confidence) = estimateFundamental(filtered, count: count, sampleRate: sampleRate,
+                                                minHz: 25, maxHz: searchMaxHz, scratch: &scratch)
+    out.hz = hz
+    out.confidence = confidence
+
+    out.isBass = confidence >= 0.45
+        && out.peakRatioDb < peakRatioLimitDb
+        && out.crestDb < crestLimitDb
+    return out
 }
 
 /// Maps a measured level in dBFS to a drive level (0...1) using the floor / ceiling / gamma / gain
@@ -969,6 +1062,69 @@ func selfTest(options: Options) -> Never {
         return (db, hz, level)
     }
 
+    /// Feeds an arbitrary signal through the real filter chain and asks the real analyser what it
+    /// makes of it -- the same code path the program runs at runtime, including the bass gate.
+    func judge(_ samples: [Float]) -> BassWindow {
+        let test = InputProcessor()
+        test.configure(sampleRate: sampleRate, channels: 1,
+                       cutoff: options.cutoffHz, highpass: options.highpassHz)
+        samples.withUnsafeBufferPointer { buf in
+            test.process(data: buf.baseAddress!, sampleCount: samples.count)
+        }
+        var filtered = [Float](repeating: 0, count: window)
+        var raw = [Float](repeating: 0, count: window)
+        let got = test.ring.copyLast(window, into: &filtered)
+        let gotRaw = test.rawRing.copyLast(window, into: &raw)
+        let count = min(got, gotRaw)
+        guard count >= window / 2 else { return BassWindow() }
+        return analyseBassWindow(filtered: filtered, raw: raw, count: count,
+                                  sampleRate: sampleRate, options: options,
+                                  scratch: &decimated)
+    }
+
+    /// A deterministic noise source, so the self test is reproducible run to run.
+    func noiseBurst(offsetFromEnd: Int, durationMs: Double, amplitude: Double) -> [Float] {
+        let total = Int(sampleRate)
+        var samples = [Float](repeating: 0, count: total)
+        let burst = Int(sampleRate * durationMs / 1000.0)
+        let start = total - offsetFromEnd - burst
+        guard start >= 0 else { return samples }
+        var state: UInt64 = 0x5DEECE66D
+        for i in 0..<burst {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            let v = Double((state >> 33) % 2_000_001) / 1_000_000.0 - 1.0
+            samples[start + i] = Float(v * amplitude)
+        }
+        return samples
+    }
+
+    /// A kick drum: a 60 Hz body with a fast attack and a musical decay.
+    func kick(offsetFromEnd: Int, amplitude: Double) -> [Float] {
+        let total = Int(sampleRate)
+        var samples = [Float](repeating: 0, count: total)
+        let length = Int(sampleRate * 0.25)
+        let start = total - offsetFromEnd - length
+        guard start >= 0 else { return samples }
+        for i in 0..<length {
+            let t = Double(i) / sampleRate
+            let env = exp(-t * 7.0) * (1 - exp(-t * 800.0))
+            samples[start + i] = Float(amplitude * env * sin(2 * Double.pi * 60.0 * t))
+        }
+        return samples
+    }
+
+    /// A sustained bass note.
+    func bassTone(hz: Double, offsetFromEnd: Int, amplitude: Double) -> [Float] {
+        let total = Int(sampleRate)
+        var samples = [Float](repeating: 0, count: total)
+        let start = max(0, total - offsetFromEnd)
+        for i in start..<total {
+            let t = Double(i - start) / sampleRate
+            samples[i] = Float(amplitude * sin(2 * Double.pi * hz * t))
+        }
+        return samples
+    }
+
     print("trackpad-subwoofer — self test")
     print("  (no audio device, no haptic motor, no sound)\n")
 
@@ -999,6 +1155,62 @@ func selfTest(options: Options) -> Never {
     print("  50 Hz sine      -> \(String(format: "%.1f dB", fifty.db))   f0 \(String(format: "%.1f", fifty.hz)) Hz   level \(String(format: "%.2f", fifty.level))")
     check(abs(fifty.hz - 50) <= 8, "50 Hz is detected as 50 Hz")
 
+    // The bass gate. This is the regression test for the bug where a knock on the desk made the
+    // trackpad buzz at a stale 60 Hz: the level gate alone let any loud transient through, and
+    // the frequency it buzzed at was whatever it happened to be tracking already.
+    //
+    // A UI click is broadband and short. The low-pass filter turns its energy into a ringing
+    // tone that looks like a clean fundamental, so the gate checks two things against the
+    // ORIGINAL signal: that its peak really is in the bass band, and that the bass-band energy
+    // is sustained rather than a transient tail.
+    print("\n  bass gate (what actually reaches the motor):")
+    var clickRejected = true
+    var worstClickPeak = -99.0, worstClickCrest = -99.0
+    for (label, offset) in [("at the window start", 3072), ("in the middle", 1536), ("at the end", 288)] {
+        let w = judge(noiseBurst(offsetFromEnd: offset, durationMs: 6, amplitude: 0.95))
+        let accepted = w.isBass ? levelForDb(w.db, options: options) : 0
+        print("    click \(label.padding(toLength: 18, withPad: " ", startingAt: 0)) -> "
+              + String(format: "bass %.1f dB  peak %+.1f dB  crest %.1f dB  f0 %.1f Hz  conf %.2f  drive %.2f",
+                       w.db, w.peakRatioDb, w.crestDb, w.hz, w.confidence, accepted))
+        if accepted > 0 { clickRejected = false }
+        worstClickPeak = max(worstClickPeak, w.peakRatioDb)
+        worstClickCrest = max(worstClickCrest, w.crestDb)
+    }
+    check(clickRejected, "a broadband click never produces drive, wherever it lands in the window")
+
+    let kickWindow = judge(kick(offsetFromEnd: 1536, amplitude: 0.9))
+    print("    kick drum (60 Hz)                -> "
+          + String(format: "bass %.1f dB  peak %+.1f dB  crest %.1f dB  f0 %.1f Hz  conf %.2f  drive %.2f",
+                   kickWindow.db, kickWindow.peakRatioDb, kickWindow.crestDb, kickWindow.hz,
+                   kickWindow.confidence, levelForDb(kickWindow.db, options: options)))
+    check(kickWindow.isBass, "a kick drum is recognised as bass")
+    check(abs(kickWindow.hz - 60) <= 10, "the kick's fundamental is found at 60 Hz")
+    check(levelForDb(kickWindow.db, options: options) > 0.05, "a kick drum produces drive")
+
+    let bassWindow = judge(bassTone(hz: 60, offsetFromEnd: 3072, amplitude: 0.6))
+    print("    sustained 60 Hz bass             -> "
+          + String(format: "bass %.1f dB  peak %+.1f dB  crest %.1f dB  f0 %.1f Hz  conf %.2f  drive %.2f",
+                   bassWindow.db, bassWindow.peakRatioDb, bassWindow.crestDb, bassWindow.hz,
+                   bassWindow.confidence, levelForDb(bassWindow.db, options: options)))
+    check(bassWindow.isBass, "a sustained bass note is recognised as bass")
+    check(levelForDb(bassWindow.db, options: options) > 0.05, "a sustained bass note produces drive")
+
+    let thump = judge(noiseBurst(offsetFromEnd: 1536, durationMs: 40, amplitude: 0.95))
+    check(!thump.isBass, "a loud broadband thump is not mistaken for bass")
+
+    // The margins, not just the verdict. If the filter or the limits ever change, the separation
+    // between a click and real bass has to keep room on BOTH sides -- otherwise the gate is one
+    // filter tweak away from either buzzing at every click or ignoring the bass.
+    let worstBassPeak = max(kickWindow.peakRatioDb, bassWindow.peakRatioDb)
+    let worstBassCrest = max(kickWindow.crestDb, bassWindow.crestDb)
+    print("    margins:  click peak \(String(format: "%+.1f", worstClickPeak)) dB / crest \(String(format: "%.1f", worstClickCrest)) dB"
+          + "   vs   bass peak \(String(format: "%+.1f", worstBassPeak)) dB / crest \(String(format: "%.1f", worstBassCrest)) dB"
+          + "   (limits: peak \(String(format: "%.0f", peakRatioLimitDb)) dB, crest \(String(format: "%.0f", crestLimitDb)) dB)")
+    check(worstClickPeak - peakRatioLimitDb > 5, "the worst click clears the peak limit by a wide margin")
+    check(peakRatioLimitDb - worstBassPeak > 5, "real bass clears the peak limit by a wide margin")
+    check(worstClickCrest - crestLimitDb > 0.5, "the worst click clears the crest limit")
+    check(crestLimitDb - worstBassCrest > 1.0, "real bass clears the crest limit")
+
     // The tone shape the program sends must survive the encoder as a distinct, supported type.
     // This builds actuation OBJECTS only — it never actuates, so nothing moves and no sound.
     // It goes through waveformName(), the same mapping the program uses, so a case bug can't hide.
@@ -1021,6 +1233,32 @@ func selfTest(options: Options) -> Never {
     // The encoder's type string is case-sensitive: lowercase silently becomes Gaussian.
     if let lower = encodedToneType("square") {
         check(lower == 0, "a lowercase type string is rejected by the encoder (so the mapping matters)")
+
+    // The encoder's frequency and duration fields. These are the two limits that decide whether
+    // the meter can lie about what the trackpad is doing, so they are checked against the same
+    // arithmetic the firmware's encoder uses. Objects only — never actuated, so nothing moves
+    // and no sound plays.
+    print("\n  encoder limits (objects only, never actuated):")
+    if let p = encodedToneParameters(hz: 1500.0, durMs: 3.0, delayMs: 7.0) {
+        print("    sent 1.5 kHz / 3 ms / 7 ms delay -> instance kept type \(p.typeCode), delay \(p.delayMs) ms, duration \(p.durationMs) ms, amplitude \(p.amplitude), frequency \(p.frequencyKHz) kHz")
+        check(p.frequencyKHz == 1.5, "the frequency we send is what the instance keeps (in kHz)")
+        check(p.durationMs == 3.0, "the duration we send is what the instance keeps")
+        check(p.delayMs == 7.0, "the delay we send is what the instance keeps")
+    }
+    let floorByte = encodedFrequencyByte(hz: 60.0) ?? -1
+    print("    60 Hz requested  -> frequency byte \(floorByte) -> \(24000.0 / Double(max(floorByte, 0) + 1)) Hz actual")
+    check(floorByte == 255, "a request below the floor clamps to byte 255 (93.75 Hz)")
+    check(encodedFrequencyByte(hz: 90.0) == 255, "90 Hz also clamps to the floor, so it is indistinguishable from 60 Hz")
+    check(encodedFrequencyByte(hz: 100.0) == 239, "100 Hz encodes exactly (byte 239)")
+    check(encodedFrequencyByte(hz: 425.0) == 55, "425 Hz encodes to byte 55 (428.6 Hz actual)")
+    let shortDur = encodedDurationByte(ms: 7.0)
+    let longDur = encodedDurationByte(ms: 20.0)
+    print("    7 ms duration    -> \(shortDur) samples (\(Double(shortDur) / 24.0) ms)")
+    print("    20 ms duration   -> \(longDur) samples (\(Double(longDur) / 24.0) ms) -- clipped")
+    check(shortDur == 168, "duration is encoded as a 24 kHz sample count (7 ms -> 168)")
+    check(longDur == 255, "durations past 10.625 ms are clipped to 255 samples")
+    check(hardwareMaxSegmentMs <= 255.0 / 24.0, "the segment length stays inside what the encoder can carry")
+    check(hardwareMinHz == 93.75, "the drive floor is the encoder's real floor, 93.75 Hz")
     }
 
     print("\n  \(failures == 0 ? "all checks passed" : "\(failures) check(s) FAILED")")
@@ -1043,12 +1281,54 @@ func encodedToneType(_ toneType: String) -> Int? {
     return code
 }
 
+/// Builds an actuation with one tone and reads back the raw parameter fields the instance kept:
+///   +0x40 tone type code, +0x44 delay ms, +0x48 duration ms, +0x4C amplitude, +0x50 frequency kHz.
+/// Objects only — never actuated.
+func encodedToneParameters(hz: Double, durMs: Double, delayMs: Double) -> (typeCode: Int, delayMs: Double, durationMs: Double, amplitude: Double, frequencyKHz: Double)? {
+    guard let actuationCreate else { return nil }
+    let shape: [String: Any] = [
+        "BaseWaveform": ["Type": "Gaussian", "Amplitude": 0.0, "DurationMS": durMs],
+        "Tones": [["Type": "Sine", "Amplitude": 1.0, "DurationMS": durMs,
+                    "DelayMS": delayMs, "FrequencykHz": hz / 1000.0]],
+    ]
+    guard let act = actuationCreate(shape as CFDictionary, 0) else { return nil }
+    let raw = UnsafeRawPointer(act)
+    func f32(_ off: Int) -> Double { Double(Float(bitPattern: raw.load(fromByteOffset: off, as: UInt32.self))) }
+    let out = (typeCode: Int(raw.load(fromByteOffset: 64, as: UInt32.self)),
+                delayMs: f32(68),
+                durationMs: f32(72),
+                amplitude: f32(76),
+                frequencyKHz: f32(80))
+    Unmanaged<AnyObject>.fromOpaque(act).release()
+    return out
+}
+
+/// The frequency byte the firmware's encoder produces: an 8-bit *period count at 24 kHz*,
+/// i.e. round(24000 / f_Hz) - 1, clamped to 0...255. Derived from the constant the encoder
+/// itself uses (1/24 at 0x1924CC558) and confirmed byte-for-byte against the encoder.
+/// Returns the encoded byte, or nil if the frequency is out of range.
+func encodedFrequencyByte(hz: Double) -> Int? {
+    guard hz > 0 else { return nil }
+    let period = (24000.0 / hz).rounded()
+    let byte = Int(period) - 1
+    return max(0, min(255, byte))
+}
+
+/// The duration/delay byte the firmware's encoder produces: an 8-bit count of 24 kHz samples.
+func encodedDurationByte(ms: Double) -> Int {
+    max(0, min(255, Int((ms * 24.0).rounded())))
+}
+
 func analysisLoop(sampleRate: Double, options: Options) {
     let window = 3072
     var buffer = [Float](repeating: 0, count: window)
+    var rawBuffer = [Float](repeating: 0, count: window)
     var decimated = [Float](repeating: 0, count: window / analysisDecimation + 8)
     var smoothedLevel = 0.0
-    var smoothedHz = 60.0
+    // The drive frequency starts at the hardware's real floor, not at a made-up 60 Hz. If the
+    // first thing the program hears is a click there is no pitch to track, and a stale
+    // frequency is exactly what it would drive at -- which is how a click became a 60 Hz buzz.
+    var smoothedHz = hardwareMinHz
     var recentDb: [Double] = []
     var elapsed = 0.0
     var feedbackHoldUntil = 0.0
@@ -1059,21 +1339,28 @@ func analysisLoop(sampleRate: Double, options: Options) {
         elapsed += dt
         let got = processor.ring.copyLast(window, into: &buffer)
         guard got >= window / 2 else { usleep(15_000); continue }
+        let gotRaw = processor.rawRing.copyLast(window, into: &rawBuffer)
+        guard gotRaw >= window / 2 else { usleep(15_000); continue }
+        let count = min(got, gotRaw)
 
-        var sumSq = 0.0
-        for i in 0..<got { let v = Double(buffer[i]); sumSq += v * v }
-        let rms = sqrt(sumSq / Double(got))
-        let db = 20 * log10(max(rms, 1e-9))
+        let measured = analyseBassWindow(filtered: buffer, raw: rawBuffer, count: count,
+                                          sampleRate: sampleRate, options: options,
+                                          scratch: &decimated)
+        let db = measured.db
+        let hz = measured.hz
+        let confidence = measured.confidence
 
-        var targetLevel = levelForDb(db, options: options)
+        // The drive only happens for real bass. The level alone is not enough: a click or a
+        // knock is loud enough to cross the floor, and the low-pass turns its broadband energy
+        // into a convincing-looking fundamental. Without this gate, a knock on the desk made
+        // the trackpad buzz at whatever frequency was last tracked -- the 60 Hz the program
+        // started on -- and the harder the knock, the harder it buzzed.
+        var targetLevel = measured.isBass ? levelForDb(db, options: options) : 0
 
-        // Track the fundamental, but only when it's clearly there, and slew it rather than jump.
-        // The search stops at twice the low-pass corner: above that the filter has already gutted
-        // the signal, and looking for a peak there only finds leakage and aliases.
-        let searchMaxHz = min(400, max(80, options.cutoffHz * 2))
-        let (hz, confidence) = estimateFundamental(buffer, count: got, sampleRate: sampleRate,
-                                                   minHz: 25, maxHz: searchMaxHz, scratch: &decimated)
-        if confidence >= 0.45 && hz > 0 {
+        // Track the fundamental, but only when it is confirmed as real bass, and slew it rather
+        // than jump. The search stops at twice the low-pass corner: above that the filter has
+        // already gutted the signal, and looking for a peak there only finds leakage and aliases.
+        if measured.isBass && hz > 0 {
             let target = min(max(hz, options.minDriveHz), options.maxDriveHz)
             let ratio = target / max(smoothedHz, 1)
             let maxRatio = pow(2.0, dt / 0.12)   // at most about an octave every 120 ms
@@ -1122,7 +1409,8 @@ func analysisLoop(sampleRate: Double, options: Options) {
         let coeff = 1 - exp(-dt / max(tau, 1e-4))
         smoothedLevel += (targetLevel - smoothedLevel) * coeff
 
-        control.update(level: smoothedLevel, hz: smoothedHz, db: db, confidence: confidence)
+        control.update(level: smoothedLevel, hz: smoothedHz, db: db,
+                       confidence: confidence, peakRatioDb: measured.peakRatioDb)
         usleep(25_000)
     }
 }
@@ -1144,8 +1432,13 @@ func hapticLoop(options: Options) {
         if target > 0.015 {
             let hz = min(max(options.fixedHz ?? state.hz, options.minDriveHz), options.maxDriveHz)
             let driveHz = min(max(hz, hardwareMinHz), hardwareMaxHz)
-            let cycles = max(1, Int((0.020 * driveHz).rounded()))
-            let segmentMs = 1000.0 * Double(cycles) / driveHz
+            // Segments are whole numbers of cycles so the sine never starts mid-cycle (that would
+            // click), but a whole cycle at a low drive frequency can be longer than the encoder
+            // can carry (10.625 ms). So: take as many whole cycles as fit, and if even one cycle
+            // is too long, take a partial one. Either way the encoded duration is the real one.
+            let cycles = max(1, Int((hardwareMaxSegmentMs * 0.001 * driveHz).rounded()))
+            var segmentMs = 1000.0 * Double(cycles) / driveHz
+            if segmentMs > hardwareMaxSegmentMs { segmentMs = hardwareMaxSegmentMs }
             // Ramp across the segment: drive at the midpoint between last time and now.
             let drive = Float(min(options.maxLevel, max(0, (currentLevel + target) / 2)))
             currentLevel = target
@@ -1168,8 +1461,8 @@ func hapticLoop(options: Options) {
         if options.showMeter {
             meterCounter += 1
             if meterCounter % 4 == 0 {
-                let line = String(format: "  bass %6.1f dB   f0 %5.1f Hz   drive %5.1f Hz   level %.2f   conf %.2f",
-                                  state.db, state.hz, options.fixedHz ?? state.hz, state.level, state.confidence)
+                let line = String(format: "  bass %6.1f dB   f0 %5.1f Hz   drive %5.1f Hz   level %.2f   conf %.2f   peak %5.1f dB",
+                                  state.db, state.hz, options.fixedHz ?? state.hz, state.level, state.confidence, state.peakRatioDb)
                 if interactive {
                     out(line + "\u{1B}[K\r")
                 } else if meterCounter % 40 == 0 {

@@ -3,7 +3,7 @@
 Turns the Mac's Force Touch trackpad into a **subwoofer**, driven by the **system's audio output**.
 
 ```
-system output  →  low-pass  →  bass envelope + pitch  →  haptic motor  →  glass
+system output  →  low-pass  →  bass gate  →  bass envelope + pitch  →  haptic motor  →  glass
 ```
 
 Play music with a beat on, and the trackpad rumbles with the bass. Put it on a table, mute the
@@ -81,7 +81,7 @@ raise `--gain` (or `--max-level`, up to 1.0).
 | `--exclude-app NAME` | — | Don't capture audio from apps whose bundle id contains `NAME`. |
 | `--cutoff HZ` | 120 | Low-pass corner — the top of the sub band. Lower = more muffled, deeper. |
 | `--highpass HZ` | 20 | DC blocker corner. Keeps infrasonic rumble out of the envelope. |
-| `--min-hz HZ` | 60 | Lowest frequency the motor is asked to make. |
+| `--min-hz HZ` | 93.75 | Lowest frequency the motor is asked to make. This is the hardware's real floor — see below. |
 | `--max-hz HZ` | 150 | Highest frequency the motor is asked to make. |
 | `--waveform WHICH` | `sine` | Tone shape: `sine`, `square` or `sawtooth`. Square and sawtooth carry harmonics, which is what makes a low fundamental audible. |
 | `--floor-db DB` | -55 | Input level treated as silence. |
@@ -123,7 +123,7 @@ raise `--gain` (or `--max-level`, up to 1.0).
 ./trackpad-subwoofer --floor-db -45 --max-level 0.5
 
 # one steady tone you can feel, no pitch tracking
-./trackpad-subwoofer --fixed-hz 60
+./trackpad-subwoofer --fixed-hz 94
 
 # rumble with the room instead of the computer (uses the microphone)
 ./trackpad-subwoofer --source input
@@ -141,37 +141,58 @@ raise `--gain` (or `--max-level`, up to 1.0).
 2. **Mono mix** → **DC blocker** (one-pole high-pass at 20 Hz) → **8th-order Butterworth low-pass**
    (four biquads, Q = 0.510 / 0.601 / 0.900 / 1.962, at 120 Hz). High frequencies are gone; only the
    sub band is left.
-3. **Envelope.** RMS of the filtered signal → dBFS → normalised between `--floor-db` and
+3. **The bass gate.** A level on its own is not a licence to drive the motor. A UI click, or a
+   knock on the desk, is loud enough to cross the level floor — and the low-pass turns its
+   broadband energy into a ringing tone that looks like a clean fundamental. So every window is
+   checked against the *original* signal: the peak has to be in the bass band (the ratio of the
+   original peak to the filtered peak stays under 18 dB) and the bass-band energy has to be
+   sustained rather than a transient (crest factor under 9 dB). Real music clears both by 15 dB
+   or more; a click misses by 10 dB or more. A window that fails the gate drives nothing.
+4. **Envelope.** RMS of the filtered signal → dBFS → normalised between `--floor-db` and
    `--ceiling-db` → gamma curve → gain, with fast attack and slow release so a kick drum hits hard
    and the rumble fades out.
-4. **Pitch.** Normalised autocorrelation on the decimated filtered signal finds the fundamental
+5. **Pitch.** Normalised autocorrelation on the decimated filtered signal finds the fundamental
    (25 Hz up to twice the low-pass corner). It's slewed, not jumped, so the motor glides instead of
-   clicking. The fundamental becomes the motor's drive frequency, clamped to `--min-hz`…`--max-hz`.
-5. **Haptic.** `MultitouchSupport` (private framework, resolved with `dlopen`/`dlsym`):
+   clicking. The fundamental becomes the motor's drive frequency, clamped to `--min-hz`…`--max-hz`,
+   and it only moves on windows the gate accepted — so the motor never buzzes at a frequency it
+   has stopped hearing.
+6. **Haptic.** `MultitouchSupport` (private framework, resolved with `dlopen`/`dlsym`):
    `MTActuatorCreateFromDeviceID` → `MTActuatorOpen` → `MTActuationCreateFromDictionary` →
-   `MTActuationActuate`. Each ~20 ms segment is a whole number of cycles of the current drive
-   frequency, so the sine never starts mid-cycle. The tone shape (`Sine`, `Square`, `Sawtooth`)
-   goes in the same dictionary.
+   `MTActuationActuate`. Each segment is a whole number of cycles of the current drive frequency
+   (capped at the encoder's 10.625 ms), so the sine never starts mid-cycle. The tone shape
+   (`Sine`, `Square`, `Sawtooth`) goes in the same dictionary.
 
 ### Notes on the range
 
 The motor can't reproduce true sub-bass, so the program plays the trackpad's strong, felt range:
-roughly **60–150 Hz**. Below that the Taptic engine just thuds; above it the glass gets buzzy
+roughly **94–150 Hz**. Below that the Taptic engine just thuds; above it the glass gets buzzy
 rather than deep. The default band is chosen so it *feels* like a subwoofer rather than sounding
 like one.
 
-**60 Hz is a hard floor, not a default.** Apple's own actuation tables bottom out at 0.06 kHz —
-nothing in them goes lower — and the encoder quantises the frequency you request logarithmically
-onto that table. Asking for 35 Hz does not give you 35 Hz; it gives you the lowest tone the
-hardware has, or a mushy one. The drive is clamped to the hardware's range (60 Hz – 3.8 kHz) so
-the meter never claims a frequency the trackpad cannot produce.
+**93.75 Hz is a hard floor, not a default.** This is measured against the encoder, not guessed
+from Apple's tables. The frequency field is an 8-bit **period count at 24 kHz**, so the byte is
+`round(24000 / f_Hz) - 1`, clamped to 0…255. Byte 255 means 24000/256 = **93.75 Hz** and
+nothing below it can be represented. Apple's own actuation tables ask for 0.06 kHz (60 Hz) and
+0.09 kHz (90 Hz) — **both encode to byte 255**, so they are indistinguishable after encoding and
+both render at 93.75 Hz. Ask for less and you get 93.75 Hz, not less.
 
-The trackpad has no speaker — it has a motor that taps the glass. Driving it at 60–150 Hz makes
+The grid is **linear in period**, so it is fine at the bottom and coarse at the top: below ~600 Hz
+the steps are small, above it they are large (3.4 / 3.6 / 3.8 kHz all collapse to byte 5, i.e.
+4 kHz). The drive is clamped to the hardware's real range (**93.75 Hz – 4 kHz**) so the meter
+never claims a frequency the trackpad cannot produce.
+
+**Durations are clipped at 10.625 ms.** Duration and delay are 8-bit counts of 24 kHz samples, so
+the longest the encoder carries is 255 samples = 255/24 = **10.625 ms**. Anything longer is
+silently truncated — which would leave audible gaps between tones, because the driver sleeps for
+the full segment but the motor only plays the clipped part. Segments are therefore sized to fit
+inside the cap.
+
+The trackpad has no speaker — it has a motor that taps the glass. Driving it at 94–150 Hz makes
 the glass move in slow thumps you can feel through a desk. `--waveform square` adds harmonics that
 land in the trackpad's loudest octave (around 1 kHz), which is what turns a faint thump into
 something you can actually hear.
 
-### Four things that bite when you build this
+### Five things that bite when you build this
 
 Worth recording, because each one cost a debugging round:
 
@@ -191,6 +212,13 @@ Worth recording, because each one cost a debugging round:
   glass, the glass shakes the air, the mic hears the motor. The guard handles that (runaway → 150 ms
   mute; steady self-locked hum → halved drive), and `--device "BlackHole 2ch"` avoids the loop
   entirely.
+- **A level gate is not a bass gate.** Early versions drove the motor whenever the filtered level
+  crossed `--floor-db`, whatever the sound actually was. A knock on the desk is broadband, so the
+  low-pass made a convincing-looking fundamental out of it — and because the pitch tracker only
+  *updated* the frequency when it was confident, the motor kept buzzing at whatever it was already
+  tracking. It started at a made-up 60 Hz, so a knock produced a 60 Hz buzz, and the harder the
+  knock, the louder it buzzed. The fix is the bass gate above: the drive only happens for a window
+  confirmed as bass, and the tracked frequency starts at the hardware floor instead of 60 Hz.
 
 ## Safety
 
